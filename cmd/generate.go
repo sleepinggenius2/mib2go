@@ -117,7 +117,7 @@ var generateCmd = &cobra.Command{
 					fmt.Fprintf(buf, "\t\tOidLen: %d,\n", oidLen)
 
 					if node.Kind&(types.NodeColumn|types.NodeScalar) > 0 {
-						fmt.Fprintln(buf, "\t\tType: NodeType{")
+						fmt.Fprintln(buf, "\t\tType: gosmi.Type{")
 						fmt.Fprintf(buf, "\t\t\tBaseType: types.BaseType%s,\n", node.Type.BaseType)
 						if node.Type.Enum != nil {
 							fmt.Fprintln(buf, "\t\t\tEnum: &gosmi.Enum{")
@@ -139,6 +139,9 @@ var generateCmd = &cobra.Command{
 							}
 							fmt.Fprintln(buf, "\t\t\t},")
 						}
+						if node.Type.Units != "" {
+							fmt.Fprintf(buf, "\t\t\tUnits: %q,\n", node.Type.Units)
+						}
 						fmt.Fprintln(buf, "\t\t},")
 					} else if node.Kind == types.NodeTable {
 						fmt.Fprintf(buf, "\t\tRow: %s.%s,\n", formattedModuleName, formatNodeName(node.GetRow().Name))
@@ -156,6 +159,12 @@ var generateCmd = &cobra.Command{
 						}
 						fmt.Fprintln(buf, "\t\t},")
 					} else if node.Kind == types.NodeNotification {
+						objects := node.GetNotificationObjects()
+						fmt.Fprintln(buf, "\t\tObjects: []ScalarNode{")
+						for _, object := range objects {
+							fmt.Fprintf(buf, "\t\t\t%s.%s,\n", formattedModuleName, formatNodeName(object.Name))
+						}
+						fmt.Fprintln(buf, "\t\t},")
 					}
 
 					fmt.Fprintln(buf, "\t},")
