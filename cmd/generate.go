@@ -24,16 +24,31 @@ import (
 	"bytes"
 	"fmt"
 	"go/format"
+	"io"
 	"log"
 	"os"
+	"path"
 	"strings"
 
+	"github.com/pkg/errors"
 	"github.com/sleepinggenius2/gosmi"
 	"github.com/sleepinggenius2/gosmi/types"
 	"github.com/spf13/cobra"
 )
 
+const fileHeader = `package %s
+
+import (
+	"github.com/sleepinggenius2/gosmi"
+	"github.com/sleepinggenius2/gosmi/models"
+	"github.com/sleepinggenius2/gosmi/types"
+)
+
+`
+const allowedNodeKinds = types.NodeScalar | types.NodeTable | types.NodeRow | types.NodeColumn | types.NodeNotification
+
 var (
+	outDir      string
 	outFilename string
 	packageName string
 	paths       []string
@@ -42,10 +57,10 @@ var (
 // generateCmd represents the generate command
 var generateCmd = &cobra.Command{
 	Use:   "generate",
-	Short: "Generates a Go file from a MIB",
-	Long:  `Generates a Go file from a MIB.`,
+	Short: "Generates Go files from MIBs",
+	Long:  `Generates Go files from MIBs.`,
 	Args:  cobra.MinimumNArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) (err error) {
 		gosmi.Init()
 		defer gosmi.Exit()
 
@@ -53,137 +68,82 @@ var generateCmd = &cobra.Command{
 			gosmi.AppendPath(path)
 		}
 
-		out := os.Stdout
-		if outFilename != "" && outFilename != "-" {
+		var out *os.File
+		if outFilename == "-" {
+			out = os.Stdout
+		} else if outFilename != "" {
 			var err error
 			out, err = os.OpenFile(outFilename, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
 			if err != nil {
-				log.Fatalf("Error opening file: %v\n", err)
+				return errors.Wrapf(err, "Opening file %s", outFilename)
 			}
 			defer out.Close()
 			log.Printf("Outputting to %s\n", outFilename)
 		}
 
-		buf := &bytes.Buffer{}
+		typesMap := make(map[string]*gosmi.Type)
 
-		for _, arg := range args {
+		for i, arg := range args {
 			moduleName, err := gosmi.LoadModule(arg)
 			if err != nil {
-				log.Fatalf("Error loading module [%s]: %v\n", arg, err)
+				return errors.Wrapf(err, "Loading module %s", arg)
 			}
 
 			module, err := gosmi.GetModule(moduleName)
 			if err != nil {
-				log.Fatalf("Error getting module [%s]: %v\n", moduleName, err)
+				return errors.Wrapf(err, "Getting module %s", moduleName)
 			}
 
-			formattedModuleName := formatModuleName(moduleName)
+			fileBuf := &bytes.Buffer{}
+			if out == nil || i == 0 {
+				fmt.Fprintf(fileBuf, fileHeader, packageName)
+			}
 
-			fmt.Fprintf(buf, "package %s\n\n", packageName)
-			fmt.Fprintln(buf,
-				`import (
-	"github.com/sleepinggenius2/gosmi"
-	"github.com/sleepinggenius2/gosmi/models"
-	"github.com/sleepinggenius2/gosmi/types"
-)`)
-			fmt.Fprintf(buf, "\ntype %sModule struct {\n", formattedModuleName)
+			generateMibFile(module, fileBuf, typesMap)
 
-			nodes := module.GetNodes()
-			for _, node := range nodes {
-				if node.Kind&(types.NodeScalar|types.NodeTable|types.NodeRow|types.NodeColumn|types.NodeNotification) > 0 {
-					fmt.Fprintf(buf, "\t%s\tmodels.%sNode\n", formatNodeName(node.Name), node.Kind)
+			outFile := out
+			if outFile == nil {
+				filename := path.Join(outDir, strings.ToLower(module.Name)+".go")
+				outFile, err = os.OpenFile(filename, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+				if err != nil {
+					return errors.Wrapf(err, "Opening file %s", filename)
 				}
-			}
-			fmt.Fprintln(buf, "}")
-
-			fmt.Fprintf(buf, "\nvar %s = %sModule{", formattedModuleName, formattedModuleName)
-
-			for _, node := range nodes {
-				if node.Kind&(types.NodeScalar|types.NodeTable|types.NodeRow|types.NodeColumn|types.NodeNotification) > 0 {
-					fmt.Fprintln(buf)
-
-					fmt.Fprintf(buf, "\t%s: models.%sNode{\n", formatNodeName(node.Name), node.Kind)
-					fmt.Fprintf(buf, "\t\tName: %q,\n", node.Name)
-					oid := node.Oid
-					oidFormatted := node.RenderNumeric()
-					oidLen := node.OidLen
-					if node.Kind == types.NodeScalar {
-						oid = append(oid, 0)
-						oidFormatted += ".0"
-						oidLen++
-					}
-					fmt.Fprintf(buf, "\t\tOid: %#v,\n", oid)
-					fmt.Fprintf(buf, "\t\tOidFormatted: %q,\n", oidFormatted)
-					fmt.Fprintf(buf, "\t\tOidLen: %d,\n", oidLen)
-
-					if node.Kind&(types.NodeColumn|types.NodeScalar) > 0 {
-						fmt.Fprintln(buf, "\t\tType: gosmi.Type{")
-						fmt.Fprintf(buf, "\t\t\tBaseType: types.BaseType%s,\n", node.Type.BaseType)
-						if node.Type.Enum != nil {
-							fmt.Fprintln(buf, "\t\t\tEnum: &gosmi.Enum{")
-							fmt.Fprintf(buf, "\t\t\t\tBaseType: types.BaseType%s,\n\t\t\t\tValues: []gosmi.NamedNumber{\n", node.Type.Enum.BaseType)
-							for _, value := range node.Type.Enum.Values {
-								fmt.Fprintf(buf, "\t\t\t\t\t%#v,\n", value)
-							}
-							fmt.Fprintln(buf, "\t\t\t\t},\n\t\t\t},")
-						}
-						if node.Type.Format != "" {
-							fmt.Fprintf(buf, "\t\t\tFormat: %q,\n", node.Type.Format)
-						}
-						// TODO: fmt.Fprintf(buf, "\t\tFormatter: %#v,\n", node.GetValueFormatter(gosmi.FormatAll))
-						fmt.Fprintf(buf, "\t\t\tName: %q,\n", node.Type.Name)
-						if len(node.Type.Ranges) > 0 {
-							fmt.Fprintln(buf, "\t\t\tRanges: []gosmi.Range{")
-							for _, typeRange := range node.Type.Ranges {
-								fmt.Fprintf(buf, "\t\t\t\tgosmi.Range{BaseType: types.BaseType%s, MinValue: %#v, MaxValue: %#v},\n", typeRange.BaseType, typeRange.MinValue, typeRange.MaxValue)
-							}
-							fmt.Fprintln(buf, "\t\t\t},")
-						}
-						if node.Type.Units != "" {
-							fmt.Fprintf(buf, "\t\t\tUnits: %q,\n", node.Type.Units)
-						}
-						fmt.Fprintln(buf, "\t\t},")
-					} else if node.Kind == types.NodeTable {
-						fmt.Fprintf(buf, "\t\tRow: %s.%s,\n", formattedModuleName, formatNodeName(node.GetRow().Name))
-					} else if node.Kind == types.NodeRow {
-						fmt.Fprintln(buf, "\t\tColumns: []ColumnNode{")
-						_, columnOrder := node.GetColumns()
-						for _, column := range columnOrder {
-							fmt.Fprintf(buf, "\t\t\t%s.%s,\n", formattedModuleName, formatNodeName(column))
-						}
-						fmt.Fprintln(buf, "\t\t},")
-						fmt.Fprintln(buf, "\t\tIndex: []ScalarNode{")
-						indices := node.GetIndex()
-						for _, index := range indices {
-							fmt.Fprintf(buf, "\t\t\t%s.%s,\n", formattedModuleName, formatNodeName(index.Name))
-						}
-						fmt.Fprintln(buf, "\t\t},")
-					} else if node.Kind == types.NodeNotification {
-						objects := node.GetNotificationObjects()
-						fmt.Fprintln(buf, "\t\tObjects: []ScalarNode{")
-						for _, object := range objects {
-							fmt.Fprintf(buf, "\t\t\t%s.%s,\n", formattedModuleName, formatNodeName(object.Name))
-						}
-						fmt.Fprintln(buf, "\t\t},")
-					}
-
-					fmt.Fprintln(buf, "\t},")
-				}
+				defer outFile.Close()
+				log.Printf("Outputting to %s\n", filename)
 			}
 
-			fmt.Fprintln(buf, "}")
+			err = writeGoFile(outFile, fileBuf.Bytes())
+			if err != nil {
+				return errors.Wrap(err, "Writing module Go file")
+			}
 		}
 
-		formattedOutput, err := format.Source(buf.Bytes())
-		if err != nil {
-			out.Write(buf.Bytes())
-			log.Fatalf("Error generating output: %v\n", err)
+		typesBuf := &bytes.Buffer{}
+		if out == nil {
+			fmt.Fprintf(typesBuf, fileHeader, packageName)
 		}
 
-		out.Write(formattedOutput)
-		if err != nil {
-			log.Fatalf("Error writing output: %v\n", err)
+		for _, nodeType := range typesMap {
+			generateTypeBlock(typesBuf, nodeType, true)
 		}
+
+		outFile := out
+		if outFile == nil {
+			filename := "types.go"
+			outFile, err = os.OpenFile(filename, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+			if err != nil {
+				return errors.Wrapf(err, "Opening file %s", filename)
+			}
+			defer outFile.Close()
+			log.Printf("Outputting to %s\n", filename)
+		}
+
+		err = writeGoFile(outFile, typesBuf.Bytes())
+		if err != nil {
+			return errors.Wrap(err, "Writing types Go file")
+		}
+
+		return nil
 	},
 }
 
@@ -199,6 +159,133 @@ func formatNodeName(nodeName string) (formattedName string) {
 	return strings.ToUpper(nodeName[:1]) + nodeName[1:]
 }
 
+func generateMibFile(module gosmi.Module, buf io.Writer, typesMap map[string]*gosmi.Type) {
+	formattedModuleName := formatModuleName(module.Name)
+	nodes := module.GetNodes()
+
+	fmt.Fprintf(buf, "type %sModule struct {\n", formattedModuleName)
+	for _, node := range nodes {
+		if node.Kind&allowedNodeKinds > 0 {
+			fmt.Fprintf(buf, "\t%s\tmodels.%sNode\n", formatNodeName(node.Name), node.Kind)
+		}
+	}
+	fmt.Fprintf(buf, "}\n\n")
+
+	fmt.Fprintf(buf, "var %s = %sModule{\n", formattedModuleName, formattedModuleName)
+	for _, node := range nodes {
+		if node.Kind&allowedNodeKinds > 0 {
+			fmt.Fprintf(buf, "\t%s: models.%sNode{\n", formatNodeName(node.Name), node.Kind)
+			fmt.Fprintf(buf, "\t\tName: %q,\n", node.Name)
+			oid := node.Oid
+			oidFormatted := node.RenderNumeric()
+			oidLen := node.OidLen
+			if node.Kind == types.NodeScalar {
+				oid = append(oid, 0)
+				oidFormatted += ".0"
+				oidLen++
+			}
+			fmt.Fprintf(buf, "\t\tOid: %#v,\n", oid)
+			fmt.Fprintf(buf, "\t\tOidFormatted: %q,\n", oidFormatted)
+			fmt.Fprintf(buf, "\t\tOidLen: %d,\n", oidLen)
+
+			if node.Kind&(types.NodeColumn|types.NodeScalar) > 0 {
+				switch node.Type.Name {
+				case "Integer32", "OctetString", "ObjectIdentifier", "Unsigned32", "Integer64", "Unsigned64", "Enumeration", "Bits":
+					generateTypeBlock(buf, node.Type, false)
+				default:
+					if _, ok := typesMap[node.Type.Name]; !ok {
+						typesMap[node.Type.Name] = node.Type
+					}
+					fmt.Fprintf(buf, "\t\tType: %sType,\n", formatNodeName(node.Type.Name))
+				}
+			} else if node.Kind == types.NodeTable {
+				fmt.Fprintf(buf, "\t\tRow: %s.%s,\n", formattedModuleName, formatNodeName(node.GetRow().Name))
+			} else if node.Kind == types.NodeRow {
+				fmt.Fprintf(buf, "\t\tColumns: []ColumnNode{\n")
+				_, columnOrder := node.GetColumns()
+				for _, column := range columnOrder {
+					fmt.Fprintf(buf, "\t\t\t%s.%s,\n", formattedModuleName, formatNodeName(column))
+				}
+				fmt.Fprintf(buf, "\t\t},\n")
+				fmt.Fprintf(buf, "\t\tIndex: []ColumnNode{\n")
+				indices := node.GetIndex()
+				for _, index := range indices {
+					indexModule := index.GetModule()
+					fmt.Fprintf(buf, "\t\t\t%s.%s,\n", formatModuleName(indexModule.Name), formatNodeName(index.Name))
+				}
+				fmt.Fprintf(buf, "\t\t},\n")
+			} else if node.Kind == types.NodeNotification {
+				objects := node.GetNotificationObjects()
+				fmt.Fprintf(buf, "\t\tObjects: []ScalarNode{\n")
+				for _, object := range objects {
+					fmt.Fprintf(buf, "\t\t\t%s.%s,\n", formattedModuleName, formatNodeName(object.Name))
+				}
+				fmt.Fprintf(buf, "\t\t},\n")
+			}
+
+			fmt.Fprintf(buf, "\t},\n")
+		}
+	}
+
+	fmt.Fprintf(buf, "}\n")
+}
+
+func generateTypeBlock(buf io.Writer, t *gosmi.Type, asVar bool) {
+	if asVar {
+		fmt.Fprintf(buf, "var %sType = gosmi.Type{\n", formatNodeName(t.Name))
+	} else {
+		fmt.Fprintf(buf, "Type: gosmi.Type{\n")
+	}
+	fmt.Fprintf(buf, "\tBaseType: types.BaseType%s,\n", t.BaseType)
+	if t.Enum != nil {
+		fmt.Fprintf(buf, "\tEnum: &gosmi.Enum{\n")
+		fmt.Fprintf(buf, "\t\tBaseType: types.BaseType%s,\n", t.Enum.BaseType)
+		fmt.Fprintf(buf, "\t\tValues: []gosmi.NamedNumber{\n")
+		for _, value := range t.Enum.Values {
+			fmt.Fprintf(buf, "\t\t\t%#v,\n", value)
+		}
+		fmt.Fprintf(buf, "\t\t},\n")
+		fmt.Fprintf(buf, "\t},\n")
+	}
+	if t.Format != "" {
+		fmt.Fprintf(buf, "\tFormat: %q,\n", t.Format)
+	}
+	fmt.Fprintf(buf, "\tName: %q,\n", t.Name)
+	if len(t.Ranges) > 0 {
+		fmt.Fprintf(buf, "\tRanges: []gosmi.Range{\n")
+		for _, typeRange := range t.Ranges {
+			fmt.Fprintf(buf, "\t\tgosmi.Range{BaseType: types.BaseType%s, MinValue: %#v, MaxValue: %#v},\n",
+				typeRange.BaseType,
+				typeRange.MinValue,
+				typeRange.MaxValue,
+			)
+		}
+		fmt.Fprintf(buf, "\t},\n")
+	}
+	if t.Units != "" {
+		fmt.Fprintf(buf, "\tUnits: %q,\n", t.Units)
+	}
+	if asVar {
+		fmt.Fprintf(buf, "}\n\n")
+	} else {
+		fmt.Fprintf(buf, "},\n")
+	}
+}
+
+func writeGoFile(out io.Writer, b []byte) error {
+	formattedSource, err := format.Source(b)
+	if err != nil {
+		return errors.Wrap(err, "Generating formatted source")
+	}
+
+	_, err = out.Write(formattedSource)
+	if err != nil {
+		return errors.Wrap(err, "Writing file")
+	}
+
+	return nil
+}
+
 func init() {
 	RootCmd.AddCommand(generateCmd)
 
@@ -210,7 +297,8 @@ func init() {
 
 	// Cobra supports local flags which will only run when this command
 	// is called directly, e.g.:
-	generateCmd.Flags().StringVarP(&outFilename, "output", "o", "-", "Output filename, use - for stdout")
+	generateCmd.Flags().StringVarP(&outDir, "dir", "d", ".", "Output directory")
+	generateCmd.Flags().StringVarP(&outFilename, "output", "o", "", "Output filename, use - for stdout")
 	generateCmd.Flags().StringVarP(&packageName, "package", "p", "mibs", "The package for the generated file")
 	generateCmd.Flags().StringSliceVarP(&paths, "path", "M", []string{}, "Path(s) to add to MIB search path")
 }
