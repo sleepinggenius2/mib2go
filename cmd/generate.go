@@ -231,7 +231,11 @@ func generateMibFile(module gosmi.SmiModule, buf io.Writer, typesMap map[string]
 				objects := node.GetNotificationObjects()
 				fmt.Fprintf(buf, "\tObjects: []models.ScalarNode{\n")
 				for _, object := range objects {
-					fmt.Fprintf(buf, "\t\tmodels.ScalarNode(%s),\n", formatNodeVarName(object.Name))
+					if object.Kind == types.NodeScalar {
+						fmt.Fprintf(buf, "\t\t%s,\n", formatNodeVarName(object.Name))
+					} else {
+						fmt.Fprintf(buf, "\t\tmodels.ScalarNode(%s),\n", formatNodeVarName(object.Name))
+					}
 				}
 				fmt.Fprintf(buf, "\t},\n")
 			}
