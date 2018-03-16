@@ -130,7 +130,7 @@ var generateCmd = &cobra.Command{
 
 		outFile := out
 		if outFile == nil {
-			filename := "types.go"
+			filename := path.Join(outDir, "types.go")
 			outFile, err = os.OpenFile(filename, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
 			if err != nil {
 				return errors.Wrapf(err, "Opening file %s", filename)
@@ -156,6 +156,11 @@ func formatModuleName(moduleName string) (formattedName string) {
 	return
 }
 
+func formatModuleVarName(moduleName string) (formattedName string) {
+	formattedModuleName := formatModuleName(moduleName)
+	return strings.ToLower(formattedModuleName[:1]) + formattedModuleName[1:] + "Module"
+}
+
 func formatNodeName(nodeName string) (formattedName string) {
 	return strings.ToUpper(nodeName[:1]) + nodeName[1:]
 }
@@ -166,9 +171,10 @@ func formatNodeVarName(nodeName string) (formattedName string) {
 
 func generateMibFile(module gosmi.SmiModule, buf io.Writer, typesMap map[string]*models.Type) {
 	formattedModuleName := formatModuleName(module.Name)
+	formattedModuleVarName := formatModuleVarName(module.Name)
 	nodes := module.GetNodes()
 
-	fmt.Fprintf(buf, "type %sModule struct {\n", formattedModuleName)
+	fmt.Fprintf(buf, "type %s struct {\n", formattedModuleVarName)
 	for _, node := range nodes {
 		if node.Kind&allowedNodeKinds > 0 {
 			fmt.Fprintf(buf, "\t%s\tmodels.%sNode\n", formatNodeName(node.Name), node.Kind)
@@ -176,7 +182,7 @@ func generateMibFile(module gosmi.SmiModule, buf io.Writer, typesMap map[string]
 	}
 	fmt.Fprintf(buf, "}\n\n")
 
-	fmt.Fprintf(buf, "var %s = %sModule {\n", formattedModuleName, formattedModuleName)
+	fmt.Fprintf(buf, "var %s = %s {\n", formattedModuleName, formattedModuleVarName)
 	for _, node := range nodes {
 		if node.Kind&allowedNodeKinds > 0 {
 			fmt.Fprintf(buf, "\t%s:\t%s,\n", formatNodeName(node.Name), formatNodeVarName(node.Name))
@@ -202,7 +208,8 @@ func generateMibFile(module gosmi.SmiModule, buf io.Writer, typesMap map[string]
 			fmt.Fprintf(buf, "\t\tOidLen: %d,\n", oidLen)
 			fmt.Fprintf(buf, "\t},\n")
 
-			if node.Kind&(types.NodeColumn|types.NodeScalar) > 0 {
+			switch node.Kind {
+			case types.NodeColumn, types.NodeScalar:
 				switch node.Type.Name {
 				case "Integer32", "OctetString", "ObjectIdentifier", "Unsigned32", "Integer64", "Unsigned64", "Enumeration", "Bits":
 					generateTypeBlock(buf, node.Type, false)
@@ -212,9 +219,9 @@ func generateMibFile(module gosmi.SmiModule, buf io.Writer, typesMap map[string]
 					}
 					fmt.Fprintf(buf, "\tType: %sType,\n", formatNodeName(node.Type.Name))
 				}
-			} else if node.Kind == types.NodeTable {
+			case types.NodeTable:
 				fmt.Fprintf(buf, "\tRow: %s,\n", formatNodeVarName(node.GetRow().Name))
-			} else if node.Kind == types.NodeRow {
+			case types.NodeRow:
 				fmt.Fprintf(buf, "\tColumns: []models.ColumnNode{\n")
 				_, columnOrder := node.GetColumns()
 				for _, column := range columnOrder {
@@ -227,7 +234,7 @@ func generateMibFile(module gosmi.SmiModule, buf io.Writer, typesMap map[string]
 					fmt.Fprintf(buf, "\t\t%s,\n", formatNodeVarName(index.Name))
 				}
 				fmt.Fprintf(buf, "\t},\n")
-			} else if node.Kind == types.NodeNotification {
+			case types.NodeNotification:
 				objects := node.GetNotificationObjects()
 				fmt.Fprintf(buf, "\tObjects: []models.ScalarNode{\n")
 				for _, object := range objects {
