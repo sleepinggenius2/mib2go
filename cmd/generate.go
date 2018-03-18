@@ -84,23 +84,25 @@ var generateCmd = &cobra.Command{
 
 		typesMap := make(map[string]*models.Type)
 
-		for i, arg := range args {
-			moduleName, err := gosmi.LoadModule(arg)
+		for _, arg := range args {
+			_, err := gosmi.LoadModule(arg)
 			if err != nil {
 				return errors.Wrapf(err, "Loading module %s", arg)
 			}
+		}
 
-			module, err := gosmi.GetModule(moduleName)
-			if err != nil {
-				return errors.Wrapf(err, "Getting module %s", moduleName)
-			}
+		firstModule := true
 
+		modules := gosmi.GetLoadedModules()
+		for _, module := range modules {
 			fileBuf := &bytes.Buffer{}
-			if out == nil || i == 0 {
-				fmt.Fprintf(fileBuf, fileHeader, packageName)
-			}
 
 			generateMibFile(module, fileBuf, typesMap)
+
+			if fileBuf.Len() == 0 {
+				log.Printf("Module %s: Skipping empty module\n", module.Name)
+				continue
+			}
 
 			outFile := out
 			if outFile == nil {
@@ -110,10 +112,12 @@ var generateCmd = &cobra.Command{
 					return errors.Wrapf(err, "Opening file %s", filename)
 				}
 				defer outFile.Close()
-				log.Printf("Outputting to %s\n", filename)
+				log.Printf("Module %s: Outputting to %s\n", module.Name, filename)
 			}
 
-			err = writeGoFile(outFile, fileBuf.Bytes())
+			writeHeader := out == nil || firstModule
+			firstModule = false
+			err = writeGoFile(outFile, fileBuf.Bytes(), writeHeader)
 			if err != nil {
 				return errors.Wrap(err, "Writing module Go file")
 			}
@@ -136,10 +140,11 @@ var generateCmd = &cobra.Command{
 				return errors.Wrapf(err, "Opening file %s", filename)
 			}
 			defer outFile.Close()
-			log.Printf("Outputting to %s\n", filename)
+			log.Printf("Types: Outputting to %s\n", filename)
 		}
 
-		err = writeGoFile(outFile, typesBuf.Bytes())
+		writeHeader := out == nil
+		err = writeGoFile(outFile, typesBuf.Bytes(), writeHeader)
 		if err != nil {
 			return errors.Wrap(err, "Writing types Go file")
 		}
@@ -171,6 +176,9 @@ func formatNodeVarName(nodeName string) (formattedName string) {
 
 func generateMibFile(module gosmi.SmiModule, buf io.Writer, typesMap map[string]*models.Type) {
 	nodes := module.GetNodes(allowedNodeKinds)
+	if len(nodes) == 0 {
+		return
+	}
 
 	generateModuleStruct(buf, module.Name, nodes)
 	generateModuleVar(buf, module.Name, nodes)
@@ -324,10 +332,14 @@ func generateTypeBlock(buf io.Writer, t *models.Type, asVar bool) {
 	}
 }
 
-func writeGoFile(out io.Writer, b []byte) error {
+func writeGoFile(out io.Writer, b []byte, writeHeader bool) error {
 	formattedSource, err := format.Source(b)
 	if err != nil {
 		return errors.Wrap(err, "Generating formatted source")
+	}
+
+	if writeHeader {
+		fmt.Fprintf(out, fileHeader, packageName)
 	}
 
 	_, err = out.Write(formattedSource)
