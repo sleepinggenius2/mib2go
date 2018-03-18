@@ -170,86 +170,116 @@ func formatNodeVarName(nodeName string) (formattedName string) {
 }
 
 func generateMibFile(module gosmi.SmiModule, buf io.Writer, typesMap map[string]*models.Type) {
-	formattedModuleName := formatModuleName(module.Name)
-	formattedModuleVarName := formatModuleVarName(module.Name)
-	nodes := module.GetNodes()
+	nodes := module.GetNodes(allowedNodeKinds)
+
+	generateModuleStruct(buf, module.Name, nodes)
+	generateModuleVar(buf, module.Name, nodes)
+
+	for _, node := range nodes {
+		generateNodeVar(buf, node, typesMap)
+	}
+}
+
+func generateModuleStruct(buf io.Writer, moduleName string, nodes []gosmi.SmiNode) {
+	formattedModuleVarName := formatModuleVarName(moduleName)
 
 	fmt.Fprintf(buf, "type %s struct {\n", formattedModuleVarName)
 	for _, node := range nodes {
-		if node.Kind&allowedNodeKinds > 0 {
-			fmt.Fprintf(buf, "\t%s\tmodels.%sNode\n", formatNodeName(node.Name), node.Kind)
-		}
+		fmt.Fprintf(buf, "\t%s\tmodels.%sNode\n", formatNodeName(node.Name), node.Kind)
 	}
 	fmt.Fprintf(buf, "}\n\n")
+}
+
+func generateModuleVar(buf io.Writer, moduleName string, nodes []gosmi.SmiNode) {
+	formattedModuleName := formatModuleName(moduleName)
+	formattedModuleVarName := formatModuleVarName(moduleName)
 
 	fmt.Fprintf(buf, "var %s = %s {\n", formattedModuleName, formattedModuleVarName)
 	for _, node := range nodes {
-		if node.Kind&allowedNodeKinds > 0 {
-			fmt.Fprintf(buf, "\t%s:\t%s,\n", formatNodeName(node.Name), formatNodeVarName(node.Name))
-		}
+		fmt.Fprintf(buf, "\t%s:\t%s,\n", formatNodeName(node.Name), formatNodeVarName(node.Name))
 	}
 	fmt.Fprintf(buf, "}\n\n")
+}
 
-	for _, node := range nodes {
-		if node.Kind&allowedNodeKinds > 0 {
-			fmt.Fprintf(buf, "var %s = models.%sNode{\n", formatNodeVarName(node.Name), node.Kind)
-			fmt.Fprintf(buf, "\tBaseNode: models.BaseNode{\n")
-			fmt.Fprintf(buf, "\t\tName: %q,\n", node.Name)
-			oid := node.Oid
-			oidFormatted := node.RenderNumeric()
-			oidLen := node.OidLen
-			if node.Kind == types.NodeScalar {
-				oid = append(oid, 0)
-				oidFormatted += ".0"
-				oidLen++
-			}
-			fmt.Fprintf(buf, "\t\tOid: %#v,\n", oid)
-			fmt.Fprintf(buf, "\t\tOidFormatted: %q,\n", oidFormatted)
-			fmt.Fprintf(buf, "\t\tOidLen: %d,\n", oidLen)
-			fmt.Fprintf(buf, "\t},\n")
+func generateNodeVar(buf io.Writer, node gosmi.SmiNode, typesMap map[string]*models.Type) {
+	fmt.Fprintf(buf, "var %s = models.%sNode{\n", formatNodeVarName(node.Name), node.Kind)
 
-			switch node.Kind {
-			case types.NodeColumn, types.NodeScalar:
-				switch node.Type.Name {
-				case "Integer32", "OctetString", "ObjectIdentifier", "Unsigned32", "Integer64", "Unsigned64", "Enumeration", "Bits":
-					generateTypeBlock(buf, node.Type, false)
-				default:
-					if _, ok := typesMap[node.Type.Name]; !ok {
-						typesMap[node.Type.Name] = node.Type
-					}
-					fmt.Fprintf(buf, "\tType: %sType,\n", formatNodeName(node.Type.Name))
-				}
-			case types.NodeTable:
-				fmt.Fprintf(buf, "\tRow: %s,\n", formatNodeVarName(node.GetRow().Name))
-			case types.NodeRow:
-				fmt.Fprintf(buf, "\tColumns: []models.ColumnNode{\n")
-				_, columnOrder := node.GetColumns()
-				for _, column := range columnOrder {
-					fmt.Fprintf(buf, "\t\t%s,\n", formatNodeVarName(column))
-				}
-				fmt.Fprintf(buf, "\t},\n")
-				fmt.Fprintf(buf, "\tIndex: []models.ColumnNode{\n")
-				indices := node.GetIndex()
-				for _, index := range indices {
-					fmt.Fprintf(buf, "\t\t%s,\n", formatNodeVarName(index.Name))
-				}
-				fmt.Fprintf(buf, "\t},\n")
-			case types.NodeNotification:
-				objects := node.GetNotificationObjects()
-				fmt.Fprintf(buf, "\tObjects: []models.ScalarNode{\n")
-				for _, object := range objects {
-					if object.Kind == types.NodeScalar {
-						fmt.Fprintf(buf, "\t\t%s,\n", formatNodeVarName(object.Name))
-					} else {
-						fmt.Fprintf(buf, "\t\tmodels.ScalarNode(%s),\n", formatNodeVarName(object.Name))
-					}
-				}
-				fmt.Fprintf(buf, "\t},\n")
-			}
+	generateNodePartBaseNode(buf, node)
 
-			fmt.Fprintf(buf, "}\n")
+	switch node.Kind {
+	case types.NodeColumn, types.NodeScalar:
+		generateNodePartScalar(buf, node, typesMap)
+	case types.NodeTable:
+		generateNodePartTable(buf, node)
+	case types.NodeRow:
+		generateNodePartRow(buf, node)
+	case types.NodeNotification:
+		generateNodePartNotification(buf, node)
+	}
+
+	fmt.Fprintf(buf, "}\n")
+}
+
+func generateNodePartBaseNode(buf io.Writer, node gosmi.SmiNode) {
+	oid := node.Oid
+	oidFormatted := node.RenderNumeric()
+	oidLen := node.OidLen
+	if node.Kind == types.NodeScalar {
+		oid = append(oid, 0)
+		oidFormatted += ".0"
+		oidLen++
+	}
+
+	fmt.Fprintf(buf, "\tBaseNode: models.BaseNode{\n")
+	fmt.Fprintf(buf, "\t\tName: %q,\n", node.Name)
+	fmt.Fprintf(buf, "\t\tOid: %#v,\n", oid)
+	fmt.Fprintf(buf, "\t\tOidFormatted: %q,\n", oidFormatted)
+	fmt.Fprintf(buf, "\t\tOidLen: %d,\n", oidLen)
+	fmt.Fprintf(buf, "\t},\n")
+}
+
+func generateNodePartScalar(buf io.Writer, node gosmi.SmiNode, typesMap map[string]*models.Type) {
+	switch node.Type.Name {
+	case "Integer32", "OctetString", "ObjectIdentifier", "Unsigned32", "Integer64", "Unsigned64", "Enumeration", "Bits":
+		generateTypeBlock(buf, node.Type, false)
+	default:
+		if _, ok := typesMap[node.Type.Name]; !ok {
+			typesMap[node.Type.Name] = node.Type
+		}
+		fmt.Fprintf(buf, "\tType: %sType,\n", formatNodeName(node.Type.Name))
+	}
+}
+
+func generateNodePartTable(buf io.Writer, node gosmi.SmiNode) {
+	fmt.Fprintf(buf, "\tRow: %s,\n", formatNodeVarName(node.GetRow().Name))
+}
+
+func generateNodePartRow(buf io.Writer, node gosmi.SmiNode) {
+	fmt.Fprintf(buf, "\tColumns: []models.ColumnNode{\n")
+	_, columnOrder := node.GetColumns()
+	for _, column := range columnOrder {
+		fmt.Fprintf(buf, "\t\t%s,\n", formatNodeVarName(column))
+	}
+	fmt.Fprintf(buf, "\t},\n")
+	fmt.Fprintf(buf, "\tIndex: []models.ColumnNode{\n")
+	indices := node.GetIndex()
+	for _, index := range indices {
+		fmt.Fprintf(buf, "\t\t%s,\n", formatNodeVarName(index.Name))
+	}
+	fmt.Fprintf(buf, "\t},\n")
+}
+
+func generateNodePartNotification(buf io.Writer, node gosmi.SmiNode) {
+	objects := node.GetNotificationObjects()
+	fmt.Fprintf(buf, "\tObjects: []models.ScalarNode{\n")
+	for _, object := range objects {
+		if object.Kind == types.NodeScalar {
+			fmt.Fprintf(buf, "\t\t%s,\n", formatNodeVarName(object.Name))
+		} else {
+			fmt.Fprintf(buf, "\t\tmodels.ScalarNode(%s),\n", formatNodeVarName(object.Name))
 		}
 	}
+	fmt.Fprintf(buf, "\t},\n")
 }
 
 func generateTypeBlock(buf io.Writer, t *models.Type, asVar bool) {
