@@ -28,6 +28,7 @@ import (
 	"log"
 	"os"
 	"path"
+	"sort"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -123,13 +124,18 @@ var generateCmd = &cobra.Command{
 			}
 		}
 
-		typesBuf := &bytes.Buffer{}
-		if out == nil {
-			fmt.Fprintf(typesBuf, fileHeader, packageName)
+		typeKeys := make([]string, len(typesMap))
+		var typeIndex int
+		for key := range typesMap {
+			typeKeys[typeIndex] = key
+			typeIndex++
 		}
+		sort.Strings(typeKeys)
 
-		for _, nodeType := range typesMap {
-			generateTypeBlock(typesBuf, nodeType, true)
+		typesBuf := &bytes.Buffer{}
+
+		for _, key := range typeKeys {
+			generateTypeBlock(typesBuf, typesMap[key], true)
 		}
 
 		outFile := out
@@ -361,8 +367,9 @@ func init() {
 
 	// Cobra supports local flags which will only run when this command
 	// is called directly, e.g.:
-	generateCmd.Flags().StringVarP(&outDir, "dir", "d", ".", "Output directory")
-	generateCmd.Flags().StringVarP(&outFilename, "output", "o", "", "Output filename, use - for stdout")
-	generateCmd.Flags().StringVarP(&packageName, "package", "p", "mibs", "The package for the generated file")
-	generateCmd.Flags().StringSliceVarP(&paths, "path", "M", []string{}, "Path(s) to add to MIB search path")
+	flags := generateCmd.Flags()
+	flags.StringVarP(&outDir, "dir", "d", ".", "Output directory")
+	flags.StringVarP(&outFilename, "output", "o", "", "Output filename, use - for stdout")
+	flags.StringVarP(&packageName, "package", "p", "mibs", "The package for the generated file")
+	flags.StringSliceVarP(&paths, "path", "M", []string{}, "Path(s) to add to MIB search path")
 }
