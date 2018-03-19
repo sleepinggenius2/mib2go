@@ -27,7 +27,8 @@ import (
 	"io"
 	"log"
 	"os"
-	"path"
+	"os/user"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -56,6 +57,31 @@ var (
 	paths       []string
 )
 
+func expandPath(path string) string {
+	parts := strings.SplitN(path, string(filepath.Separator), 2)
+	firstPart := parts[0]
+	if firstPart == "" || firstPart[0] != '~' {
+		return path
+	}
+	username := firstPart[1:]
+	var (
+		u   *user.User
+		err error
+	)
+	if username == "" {
+		u, err = user.Current()
+	} else {
+		u, err = user.Lookup(username)
+	}
+	if err != nil {
+		return path
+	}
+	if len(parts) == 1 {
+		return u.HomeDir
+	}
+	return filepath.Join(u.HomeDir, parts[1])
+}
+
 // generateCmd represents the generate command
 var generateCmd = &cobra.Command{
 	Use:   "generate",
@@ -67,7 +93,23 @@ var generateCmd = &cobra.Command{
 		defer gosmi.Exit()
 
 		for _, path := range paths {
-			gosmi.AppendPath(path)
+			if path == "" {
+				continue
+			}
+			switch path[0] {
+			case '+':
+				expandedPath := expandPath(path[1:])
+				log.Println("Appending path", expandedPath)
+				gosmi.AppendPath(expandedPath)
+			case '-':
+				expandedPath := expandPath(path[1:])
+				log.Println("Prepending path", expandedPath)
+				gosmi.PrependPath(expandedPath)
+			default:
+				expandedPath := expandPath(path)
+				log.Println("Setting path", expandedPath)
+				gosmi.SetPath(expandedPath)
+			}
 		}
 
 		var out *os.File
@@ -107,7 +149,7 @@ var generateCmd = &cobra.Command{
 
 			outFile := out
 			if outFile == nil {
-				filename := path.Join(outDir, strings.ToLower(module.Name)+".go")
+				filename := filepath.Join(outDir, strings.ToLower(module.Name)+".go")
 				outFile, err = os.OpenFile(filename, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
 				if err != nil {
 					return errors.Wrapf(err, "Opening file %s", filename)
@@ -140,7 +182,7 @@ var generateCmd = &cobra.Command{
 
 		outFile := out
 		if outFile == nil {
-			filename := path.Join(outDir, "types.go")
+			filename := filepath.Join(outDir, "types.go")
 			outFile, err = os.OpenFile(filename, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
 			if err != nil {
 				return errors.Wrapf(err, "Opening file %s", filename)
