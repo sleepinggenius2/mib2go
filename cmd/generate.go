@@ -44,17 +44,54 @@ package %s
 
 import (
 	"github.com/sleepinggenius2/gosmi/models"
-	"github.com/sleepinggenius2/gosmi/types"
-)
-
 `
 const allowedNodeKinds = types.NodeScalar | types.NodeTable | types.NodeRow | types.NodeColumn | types.NodeNotification
+
+type ImportType string
+
+const (
+	ImportTypeUnknown ImportType = ""
+	ImportTypeNode    ImportType = "node"
+	ImportTypeType    ImportType = "type"
+)
+
+type ImportMap struct {
+	imports map[string]map[string]ImportType
+}
+
+func (i *ImportMap) addImport(moduleName string, importName string, importType ...ImportType) {
+	if i.imports == nil {
+		i.imports = make(map[string]map[string]ImportType)
+	}
+	if i.imports[moduleName] == nil {
+		i.imports[moduleName] = make(map[string]ImportType)
+	}
+	importTypeValue := ImportTypeUnknown
+	if len(importType) == 1 {
+		importTypeValue = importType[0]
+	}
+	i.imports[moduleName][importName] = importTypeValue
+}
+
+func (i *ImportMap) AddNode(moduleName string, importName string) {
+	i.addImport(moduleName, importName, ImportTypeNode)
+}
+
+func (i *ImportMap) AddType(moduleName string, importName string) {
+	i.addImport(moduleName, importName, ImportTypeType)
+}
+
+func (i ImportMap) Imports() map[string]map[string]ImportType {
+	return i.imports
+}
 
 var (
 	outDir      string
 	outFilename string
 	packageName string
 	paths       []string
+
+	importMap = new(ImportMap)
 )
 
 func expandPath(path string) string {
@@ -99,15 +136,15 @@ var generateCmd = &cobra.Command{
 			switch path[0] {
 			case '+':
 				expandedPath := expandPath(path[1:])
-				log.Println("Appending path", expandedPath)
+				log.Println("[I] Appending path", expandedPath)
 				gosmi.AppendPath(expandedPath)
 			case '-':
 				expandedPath := expandPath(path[1:])
-				log.Println("Prepending path", expandedPath)
+				log.Println("[I] Prepending path", expandedPath)
 				gosmi.PrependPath(expandedPath)
 			default:
 				expandedPath := expandPath(path)
-				log.Println("Setting path", expandedPath)
+				log.Println("[I] Setting path", expandedPath)
 				gosmi.SetPath(expandedPath)
 			}
 		}
@@ -122,83 +159,238 @@ var generateCmd = &cobra.Command{
 				return errors.Wrapf(err, "Opening file %s", outFilename)
 			}
 			defer out.Close()
-			log.Printf("Outputting to %s\n", outFilename)
-		}
-
-		typesMap := make(map[string]*models.Type)
-
-		for _, arg := range args {
-			_, err := gosmi.LoadModule(arg)
-			if err != nil {
-				return errors.Wrapf(err, "Loading module %s", arg)
-			}
+			log.Printf("[I] Outputting to %s\n", outFilename)
 		}
 
 		firstModule := true
+		modulesLoaded := make(map[string]bool, len(args))
+		for _, arg := range args {
+			moduleName, err := gosmi.LoadModule(arg)
+			if err != nil {
+				return errors.Wrapf(err, "Loading module %s", arg)
+			}
 
-		modules := gosmi.GetLoadedModules()
-		for _, module := range modules {
+			module, err := gosmi.GetModule(moduleName)
+			if err != nil {
+				return errors.Wrapf(err, "Getting module %s", moduleName)
+			}
+
 			fileBuf := &bytes.Buffer{}
 
-			generateMibFile(module, fileBuf, typesMap)
+			importTypes := generateMibFile(module, fileBuf)
 
-			if fileBuf.Len() == 0 {
-				log.Printf("Module %s: Skipping empty module\n", module.Name)
+			writeHeader := out == nil || firstModule
+			err = writeModule(module, fileBuf, out, writeHeader, importTypes)
+			if err != nil {
+				return errors.Wrap(err, "Write Module")
+			}
+
+			firstModule = false
+			modulesLoaded[module.Name] = true
+		}
+
+		for moduleName, imports := range importMap.Imports() {
+			if modulesLoaded[moduleName] {
 				continue
 			}
 
-			outFile := out
-			if outFile == nil {
-				filename := filepath.Join(outDir, strings.ToLower(module.Name)+".go")
-				outFile, err = os.OpenFile(filename, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
-				if err != nil {
-					return errors.Wrapf(err, "Opening file %s", filename)
+			module, err := gosmi.GetModule(moduleName)
+			if err != nil {
+				log.Fatalf("[E] Module %s: Not found\n", moduleName)
+			}
+
+			moduleImports := module.GetImports()
+			moduleNodes := module.GetNodes(allowedNodeKinds)
+			moduleTypes := module.GetTypes()
+			mapLen := len(moduleImports) + len(moduleNodes) + len(moduleTypes)
+			moduleImportMap := make(map[string]string, mapLen)
+
+			for _, i := range moduleImports {
+				moduleImportMap[i.Name] = i.Module
+			}
+
+			for _, node := range moduleNodes {
+				moduleImportMap[node.Name] = module.Name
+			}
+
+			for _, t := range moduleTypes {
+				moduleImportMap[t.Name] = module.Name
+			}
+
+			for importName, importType := range imports {
+				if importType != ImportTypeNode {
+					continue
 				}
-				defer outFile.Close()
-				log.Printf("Module %s: Outputting to %s\n", module.Name, filename)
+
+				node, err := module.GetNode(importName)
+				if err != nil {
+					log.Fatalf("[E] Module %s: Node %s not found\n", moduleName, importName)
+				}
+
+				switch node.Kind {
+				case types.NodeColumn, types.NodeScalar:
+					if node.Type == nil {
+						log.Fatalf("[E] Module %s: Type not found for node %s\n", moduleName, importName)
+					}
+
+					switch node.Type.Name {
+					case "Integer32", "OctetString", "ObjectIdentifier", "Unsigned32", "Integer64", "Unsigned64", "Enumeration", "Bits":
+						continue
+					}
+
+					typeModuleName, ok := moduleImportMap[node.Type.Name]
+					if !ok {
+						log.Fatalf("[E] Module %s: Type %s not found for node %s\n", moduleName, node.Type.Name, importName)
+					}
+					importMap.AddType(typeModuleName, node.Type.Name)
+				case types.NodeRow:
+					columns, _ := node.GetColumns()
+					for _, column := range columns {
+						importMap.AddNode(moduleName, column.Name)
+						if column.Type == nil {
+							log.Fatalf("[E] Module %s: Type not found for node %s\n", moduleName, column.Name)
+						}
+
+						switch column.Type.Name {
+						case "Integer32", "OctetString", "ObjectIdentifier", "Unsigned32", "Integer64", "Unsigned64", "Enumeration", "Bits":
+							continue
+						}
+
+						typeModuleName, ok := moduleImportMap[column.Type.Name]
+						if !ok {
+							log.Fatalf("[E] Module %s: Type %s not found for node %s\n", moduleName, column.Type.Name, column.Name)
+						}
+						importMap.AddType(typeModuleName, column.Type.Name)
+					}
+
+					indices := node.GetIndex()
+					for _, index := range indices {
+						indexModuleName, ok := moduleImportMap[index.Name]
+						if !ok {
+							log.Fatalf("[E] Module %s: Index %s not found for row %s\n", moduleName, index.Name, node.Name)
+						}
+						importMap.AddNode(indexModuleName, index.Name)
+
+						if modulesLoaded[indexModuleName] {
+							continue
+						}
+
+						if index.Type == nil {
+							log.Fatalf("[E] Module %s: Type not found for node %s\n", moduleName, index.Name)
+						}
+
+						indexModuleImportMap := moduleImportMap
+						if indexModuleName != moduleName {
+							indexModule, err := gosmi.GetModule(indexModuleName)
+							if err != nil {
+								log.Fatalf("[E] Module %s: Not found\n", indexModuleName)
+							}
+
+							indexModuleImports := indexModule.GetImports()
+							indexModuleTypes := indexModule.GetTypes()
+							indexMapLen := len(indexModuleImports) + len(indexModuleTypes)
+							indexModuleImportMap = make(map[string]string, indexMapLen)
+
+							for _, i := range indexModuleImports {
+								indexModuleImportMap[i.Name] = i.Module
+							}
+
+							for _, t := range indexModuleTypes {
+								indexModuleImportMap[t.Name] = indexModule.Name
+							}
+						}
+
+						switch index.Type.Name {
+						case "Integer32", "OctetString", "ObjectIdentifier", "Unsigned32", "Integer64", "Unsigned64", "Enumeration", "Bits":
+							continue
+						}
+
+						typeModuleName, ok := indexModuleImportMap[index.Type.Name]
+						if !ok {
+							log.Fatalf("[E] Module %s: Type %s not found for node %s\n", moduleName, index.Type.Name, index.Name)
+						}
+						importMap.AddType(typeModuleName, index.Type.Name)
+					}
+				default:
+					log.Fatalf("[E] Module %s: Node %s is of invalid kind %v\n", moduleName, importName, node.Kind)
+				}
+			}
+		}
+
+		for moduleName, imports := range importMap.Imports() {
+			if modulesLoaded[moduleName] {
+				continue
 			}
 
-			writeHeader := out == nil || firstModule
-			firstModule = false
-			err = writeGoFile(outFile, fileBuf.Bytes(), writeHeader)
+			module, err := gosmi.GetModule(moduleName)
 			if err != nil {
-				return errors.Wrap(err, "Writing module Go file")
+				log.Fatalf("[E] Module %s: Not found\n", moduleName)
 			}
-		}
 
-		typeKeys := make([]string, len(typesMap))
-		var typeIndex int
-		for key := range typesMap {
-			typeKeys[typeIndex] = key
-			typeIndex++
-		}
-		sort.Strings(typeKeys)
+			fileBuf := &bytes.Buffer{}
 
-		typesBuf := &bytes.Buffer{}
+			importTypes := generatePartialMibFile(module, fileBuf, imports)
 
-		for _, key := range typeKeys {
-			generateTypeBlock(typesBuf, typesMap[key], true)
-		}
-
-		outFile := out
-		if outFile == nil {
-			filename := filepath.Join(outDir, "types.go")
-			outFile, err = os.OpenFile(filename, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+			writeHeader := out == nil
+			err = writeModule(module, fileBuf, out, writeHeader, importTypes)
 			if err != nil {
-				return errors.Wrapf(err, "Opening file %s", filename)
+				return errors.Wrap(err, "Write Module")
 			}
-			defer outFile.Close()
-			log.Printf("Types: Outputting to %s\n", filename)
-		}
-
-		writeHeader := out == nil
-		err = writeGoFile(outFile, typesBuf.Bytes(), writeHeader)
-		if err != nil {
-			return errors.Wrap(err, "Writing types Go file")
 		}
 
 		return nil
 	},
+}
+
+func writeModule(module gosmi.SmiModule, fileBuf *bytes.Buffer, out io.Writer, firstModule bool, importTypes bool) error {
+	if fileBuf.Len() == 0 {
+		log.Printf("[I] Module %s: Skipping empty module\n", module.Name)
+		return nil
+	}
+
+	var outFile io.Writer
+	if outFile == nil {
+		filename := filepath.Join(outDir, strings.ToLower(module.Name)+".go")
+		file, err := os.OpenFile(filename, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+		if err != nil {
+			return errors.Wrapf(err, "Opening file %s", filename)
+		}
+		defer file.Close()
+		outFile = file
+		log.Printf("[I] Module %s: Outputting to %s\n", module.Name, filename)
+	} else {
+		outFile = out
+	}
+
+	writeHeader := out == nil || firstModule
+	err := writeGoFile(outFile, fileBuf.Bytes(), writeHeader, importTypes)
+	if err != nil {
+		return errors.Wrap(err, "Writing module Go file")
+	}
+	return nil
+}
+
+func writeGoFile(out io.Writer, b []byte, writeHeader bool, importTypes bool) error {
+	formattedSource, err := format.Source(b)
+	if err != nil {
+		return errors.Wrap(err, "Generating formatted source")
+	}
+
+	if writeHeader {
+		fmt.Fprintf(out, fileHeader, packageName)
+		if importTypes {
+			fmt.Fprintf(out, "\t\"github.com/sleepinggenius2/gosmi/types\"\n)\n\n")
+		} else {
+			fmt.Fprintf(out, ")\n\n")
+		}
+	}
+
+	_, err = out.Write(formattedSource)
+	if err != nil {
+		return errors.Wrap(err, "Writing file")
+	}
+
+	return nil
 }
 
 func formatModuleName(moduleName string) (formattedName string) {
@@ -211,69 +403,170 @@ func formatModuleName(moduleName string) (formattedName string) {
 
 func formatModuleVarName(moduleName string) (formattedName string) {
 	formattedModuleName := formatModuleName(moduleName)
-	return strings.ToLower(formattedModuleName[:1]) + formattedModuleName[1:] + "Module"
+	return strings.ToLower(formattedModuleName[:1]) + formattedModuleName[1:]
 }
 
 func formatNodeName(nodeName string) (formattedName string) {
 	return strings.ToUpper(nodeName[:1]) + nodeName[1:]
 }
 
-func formatNodeVarName(nodeName string) (formattedName string) {
-	return strings.ToLower(nodeName[:1]) + nodeName[1:] + "Node"
+func formatNodeVarName(moduleName string, nodeName string) (formattedName string) {
+	return formatModuleVarName(moduleName) + formatNodeName(nodeName)
 }
 
-func generateMibFile(module gosmi.SmiModule, buf io.Writer, typesMap map[string]*models.Type) {
+func generateMibFile(module gosmi.SmiModule, buf io.Writer) (importTypes bool) {
+	imports := module.GetImports()
 	nodes := module.GetNodes(allowedNodeKinds)
-	if len(nodes) == 0 {
+	types := module.GetTypes()
+	mapLen := len(imports) + len(nodes) + len(types)
+	moduleImportMap := make(map[string]string, mapLen)
+
+	for _, i := range imports {
+		moduleImportMap[i.Name] = i.Module
+	}
+
+	for _, node := range nodes {
+		moduleImportMap[node.Name] = module.Name
+	}
+
+	for _, t := range types {
+		moduleImportMap[t.Name] = module.Name
+	}
+
+	generateModuleStruct(buf, module.Name, nodes, types)
+	generateModuleVar(buf, module.Name, nodes, types)
+
+	for _, node := range nodes {
+		if generateNodeVar(buf, module.Name, node, moduleImportMap) {
+			importTypes = true
+		}
+	}
+
+	for _, t := range types {
+		generateTypeBlock(buf, &t.Type, module.Name)
+		importTypes = true
+	}
+
+	return
+}
+
+func generatePartialMibFile(module gosmi.SmiModule, buf io.Writer, imports map[string]ImportType) (importTypes bool) {
+	nodes := make([]gosmi.SmiNode, 0, len(imports))
+	types := make([]gosmi.SmiType, 0, len(imports))
+	for importName, importType := range imports {
+		switch importType {
+		case ImportTypeNode:
+			node, err := module.GetNode(importName)
+			if err != nil {
+				log.Fatalf("[E] Module %s: Node %s not found\n", module.Name, importName)
+			}
+			nodes = append(nodes, node)
+		case ImportTypeType:
+			t, err := module.GetType(importName)
+			if err != nil {
+				log.Fatalf("[E] Module %s: Type %s not found\n", module.Name, importName)
+			}
+			types = append(types, t)
+		}
+	}
+
+	sort.Slice(nodes, func(i int, j int) bool { return nodes[i].Name < nodes[j].Name })
+	sort.Slice(types, func(i int, j int) bool { return types[i].Name < types[j].Name })
+
+	generateModuleStruct(buf, module.Name, nodes, types)
+	generateModuleVar(buf, module.Name, nodes, types)
+
+	moduleImports := module.GetImports()
+	moduleNodes := module.GetNodes(allowedNodeKinds)
+	moduleTypes := module.GetTypes()
+	mapLen := len(moduleImports) + len(moduleNodes) + len(moduleTypes)
+	moduleImportMap := make(map[string]string, mapLen)
+
+	for _, i := range moduleImports {
+		moduleImportMap[i.Name] = i.Module
+	}
+
+	for _, node := range moduleNodes {
+		moduleImportMap[node.Name] = module.Name
+	}
+
+	for _, t := range moduleTypes {
+		moduleImportMap[t.Name] = module.Name
+	}
+
+	for _, node := range nodes {
+		if generateNodeVar(buf, module.Name, node, moduleImportMap) {
+			importTypes = true
+		}
+	}
+
+	for _, t := range types {
+		generateTypeBlock(buf, &t.Type, module.Name)
+		importTypes = true
+	}
+
+	return
+}
+
+func generateModuleStruct(buf io.Writer, moduleName string, nodes []gosmi.SmiNode, types []gosmi.SmiType) {
+	if len(nodes)+len(types) == 0 {
 		return
 	}
 
-	generateModuleStruct(buf, module.Name, nodes)
-	generateModuleVar(buf, module.Name, nodes)
-
-	for _, node := range nodes {
-		generateNodeVar(buf, node, typesMap)
-	}
-}
-
-func generateModuleStruct(buf io.Writer, moduleName string, nodes []gosmi.SmiNode) {
 	formattedModuleVarName := formatModuleVarName(moduleName)
 
-	fmt.Fprintf(buf, "type %s struct {\n", formattedModuleVarName)
+	fmt.Fprintf(buf, "type %sModule struct {\n", formattedModuleVarName)
 	for _, node := range nodes {
 		fmt.Fprintf(buf, "\t%s\tmodels.%sNode\n", formatNodeName(node.Name), node.Kind)
 	}
-	fmt.Fprintf(buf, "}\n\n")
-}
-
-func generateModuleVar(buf io.Writer, moduleName string, nodes []gosmi.SmiNode) {
-	formattedModuleName := formatModuleName(moduleName)
-	formattedModuleVarName := formatModuleVarName(moduleName)
-
-	fmt.Fprintf(buf, "var %s = %s {\n", formattedModuleName, formattedModuleVarName)
-	for _, node := range nodes {
-		fmt.Fprintf(buf, "\t%s:\t%s,\n", formatNodeName(node.Name), formatNodeVarName(node.Name))
+	if len(types) > 0 {
+		for _, t := range types {
+			fmt.Fprintf(buf, "\t%sType\tmodels.Type\n", formatNodeName(t.Name))
+		}
 	}
 	fmt.Fprintf(buf, "}\n\n")
 }
 
-func generateNodeVar(buf io.Writer, node gosmi.SmiNode, typesMap map[string]*models.Type) {
-	fmt.Fprintf(buf, "var %s = models.%sNode{\n", formatNodeVarName(node.Name), node.Kind)
+func generateModuleVar(buf io.Writer, moduleName string, nodes []gosmi.SmiNode, types []gosmi.SmiType) {
+	if len(nodes)+len(types) == 0 {
+		return
+	}
+
+	formattedModuleName := formatModuleName(moduleName)
+	formattedModuleVarName := formatModuleVarName(moduleName)
+
+	fmt.Fprintf(buf, "var %s = %sModule {\n", formattedModuleName, formattedModuleVarName)
+	for _, node := range nodes {
+		fmt.Fprintf(buf, "\t%s:\t%sNode,\n", formatNodeName(node.Name), formatNodeVarName(moduleName, node.Name))
+	}
+	if len(types) > 0 {
+		for _, t := range types {
+			fmt.Fprintf(buf, "\t%sType:\t%sType,\n", formatNodeName(t.Name), formatNodeVarName(moduleName, t.Name))
+		}
+	}
+	fmt.Fprintf(buf, "}\n\n")
+}
+
+func generateNodeVar(buf io.Writer, moduleName string, node gosmi.SmiNode, moduleImportMap map[string]string) (importTypes bool) {
+	fmt.Fprintf(buf, "var %sNode = models.%sNode{\n", formatNodeVarName(moduleName, node.Name), node.Kind)
 
 	generateNodePartBaseNode(buf, node)
 
 	switch node.Kind {
 	case types.NodeColumn, types.NodeScalar:
-		generateNodePartScalar(buf, node, typesMap)
+		if generateNodePartScalar(buf, node, moduleName, moduleImportMap) {
+			importTypes = true
+		}
 	case types.NodeTable:
-		generateNodePartTable(buf, node)
+		generateNodePartTable(buf, node, moduleName)
 	case types.NodeRow:
-		generateNodePartRow(buf, node)
+		generateNodePartRow(buf, node, moduleName, moduleImportMap)
 	case types.NodeNotification:
-		generateNodePartNotification(buf, node)
+		generateNodePartNotification(buf, node, moduleName, moduleImportMap)
 	}
 
-	fmt.Fprintf(buf, "}\n")
+	fmt.Fprintf(buf, "}\n\n")
+	return
 }
 
 func generateNodePartBaseNode(buf io.Writer, node gosmi.SmiNode) {
@@ -294,53 +587,84 @@ func generateNodePartBaseNode(buf io.Writer, node gosmi.SmiNode) {
 	fmt.Fprintf(buf, "\t},\n")
 }
 
-func generateNodePartScalar(buf io.Writer, node gosmi.SmiNode, typesMap map[string]*models.Type) {
+func generateNodePartScalar(buf io.Writer, node gosmi.SmiNode, moduleName string, moduleImportMap map[string]string) (importTypes bool) {
+	if node.Type == nil {
+		log.Fatalf("[E] Module %s: Type not found for node %s\n", moduleName, node.Name)
+	}
+
 	switch node.Type.Name {
 	case "Integer32", "OctetString", "ObjectIdentifier", "Unsigned32", "Integer64", "Unsigned64", "Enumeration", "Bits":
-		generateTypeBlock(buf, node.Type, false)
-	default:
-		if _, ok := typesMap[node.Type.Name]; !ok {
-			typesMap[node.Type.Name] = node.Type
-		}
-		fmt.Fprintf(buf, "\tType: %sType,\n", formatNodeName(node.Type.Name))
+		generateTypeBlock(buf, node.Type, "")
+		importTypes = true
+		return
 	}
+
+	typeModuleName, ok := moduleImportMap[node.Type.Name]
+	if !ok {
+		log.Fatalf("[E] Module %s: Type %s not found for node %s\n", moduleName, node.Type.Name, node.Name)
+	}
+	importMap.AddType(typeModuleName, node.Type.Name)
+	fmt.Fprintf(buf, "\tType: %sType,\n", formatNodeVarName(typeModuleName, node.Type.Name))
+
+	return
 }
 
-func generateNodePartTable(buf io.Writer, node gosmi.SmiNode) {
-	fmt.Fprintf(buf, "\tRow: %s,\n", formatNodeVarName(node.GetRow().Name))
+func generateNodePartTable(buf io.Writer, node gosmi.SmiNode, moduleName string) {
+	fmt.Fprintf(buf, "\tRow: %sNode,\n", formatNodeVarName(moduleName, node.GetRow().Name))
 }
 
-func generateNodePartRow(buf io.Writer, node gosmi.SmiNode) {
+func generateNodePartRow(buf io.Writer, node gosmi.SmiNode, moduleName string, moduleImportMap map[string]string) {
 	fmt.Fprintf(buf, "\tColumns: []models.ColumnNode{\n")
 	_, columnOrder := node.GetColumns()
-	for _, column := range columnOrder {
-		fmt.Fprintf(buf, "\t\t%s,\n", formatNodeVarName(column))
+	for _, columnName := range columnOrder {
+		fmt.Fprintf(buf, "\t\t%sNode,\n", formatNodeVarName(moduleName, columnName))
 	}
 	fmt.Fprintf(buf, "\t},\n")
+	augment := node.GetAugment()
+	if augment.Name != "" {
+		augmentModuleName, ok := moduleImportMap[augment.Name]
+		if !ok {
+			log.Fatalf("[E] Module %s: Augment %s not found for row %s\n", moduleName, augment.Name, node.Name)
+		}
+		importMap.AddNode(augmentModuleName, augment.Name)
+		fmt.Fprintf(buf, "\tIndex: %sNode.Index,\n", formatNodeVarName(augmentModuleName, augment.Name))
+		return
+	}
 	fmt.Fprintf(buf, "\tIndex: []models.ColumnNode{\n")
 	indices := node.GetIndex()
 	for _, index := range indices {
-		fmt.Fprintf(buf, "\t\t%s,\n", formatNodeVarName(index.Name))
+		indexModuleName, ok := moduleImportMap[index.Name]
+		if !ok {
+			log.Fatalf("[E] Module %s: Index %s not found for row %s\n", moduleName, index.Name, node.Name)
+		}
+		importMap.AddNode(indexModuleName, index.Name)
+		fmt.Fprintf(buf, "\t\t%sNode,\n", formatNodeVarName(indexModuleName, index.Name))
 	}
 	fmt.Fprintf(buf, "\t},\n")
 }
 
-func generateNodePartNotification(buf io.Writer, node gosmi.SmiNode) {
+func generateNodePartNotification(buf io.Writer, node gosmi.SmiNode, moduleName string, moduleImportMap map[string]string) {
 	objects := node.GetNotificationObjects()
 	fmt.Fprintf(buf, "\tObjects: []models.ScalarNode{\n")
 	for _, object := range objects {
+		objectModuleName, ok := moduleImportMap[object.Name]
+		if !ok {
+			log.Fatalf("[E] Module %s: Object %s not found for notification %s\n", moduleName, object.Name, node.Name)
+		}
+		importMap.AddNode(objectModuleName, object.Name)
 		if object.Kind == types.NodeScalar {
-			fmt.Fprintf(buf, "\t\t%s,\n", formatNodeVarName(object.Name))
+			fmt.Fprintf(buf, "\t\t%sNode,\n", formatNodeVarName(objectModuleName, object.Name))
 		} else {
-			fmt.Fprintf(buf, "\t\tmodels.ScalarNode(%s),\n", formatNodeVarName(object.Name))
+			fmt.Fprintf(buf, "\t\tmodels.ScalarNode(%sNode),\n", formatNodeVarName(objectModuleName, object.Name))
 		}
 	}
 	fmt.Fprintf(buf, "\t},\n")
 }
 
-func generateTypeBlock(buf io.Writer, t *models.Type, asVar bool) {
-	if asVar {
-		fmt.Fprintf(buf, "var %sType = models.Type{\n", formatNodeName(t.Name))
+func generateTypeBlock(buf io.Writer, t *models.Type, moduleName string) {
+	if moduleName != "" {
+		formattedModuleVarName := formatModuleVarName(moduleName)
+		fmt.Fprintf(buf, "var %sType = models.Type{\n", formattedModuleVarName+formatNodeName(t.Name))
 	} else {
 		fmt.Fprintf(buf, "Type: models.Type{\n")
 	}
@@ -373,29 +697,11 @@ func generateTypeBlock(buf io.Writer, t *models.Type, asVar bool) {
 	if t.Units != "" {
 		fmt.Fprintf(buf, "\tUnits: %q,\n", t.Units)
 	}
-	if asVar {
+	if moduleName != "" {
 		fmt.Fprintf(buf, "}\n\n")
 	} else {
 		fmt.Fprintf(buf, "},\n")
 	}
-}
-
-func writeGoFile(out io.Writer, b []byte, writeHeader bool) error {
-	formattedSource, err := format.Source(b)
-	if err != nil {
-		return errors.Wrap(err, "Generating formatted source")
-	}
-
-	if writeHeader {
-		fmt.Fprintf(out, fileHeader, packageName)
-	}
-
-	_, err = out.Write(formattedSource)
-	if err != nil {
-		return errors.Wrap(err, "Writing file")
-	}
-
-	return nil
 }
 
 func init() {
