@@ -630,6 +630,7 @@ func generateNodePartRow(buf io.Writer, node gosmi.SmiNode, moduleName string, m
 		fmt.Fprintf(buf, "\tIndex: %sNode.Index,\n", formatNodeVarName(augmentModuleName, augment.Name))
 		return
 	}
+	fmt.Fprintf(buf, "\tImplied: %t,\n", node.GetImplied())
 	fmt.Fprintf(buf, "\tIndex: []models.ColumnNode{\n")
 	indices := node.GetIndex()
 	for _, index := range indices {
