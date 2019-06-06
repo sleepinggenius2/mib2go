@@ -230,7 +230,7 @@ var generateCmd = &cobra.Command{
 				switch node.Kind {
 				case types.NodeColumn, types.NodeScalar:
 					if node.Type == nil {
-						log.Fatalf("[E] Module %s: Type not found for node %s\n", moduleName, importName)
+						log.Fatalf("[E] Module %s: Type not found for column/scalar node %s\n", moduleName, importName)
 					}
 
 					switch node.Type.Name {
@@ -240,7 +240,7 @@ var generateCmd = &cobra.Command{
 
 					typeModuleName, ok := moduleImportMap[node.Type.Name]
 					if !ok {
-						log.Fatalf("[E] Module %s: Type %s not found for node %s\n", moduleName, node.Type.Name, importName)
+						log.Fatalf("[E] Module %s: Type %s not found for column/scalar node %s\n", moduleName, node.Type.Name, importName)
 					}
 					importMap.AddType(typeModuleName, node.Type.Name)
 				case types.NodeRow:
@@ -248,7 +248,7 @@ var generateCmd = &cobra.Command{
 					for _, column := range columns {
 						importMap.AddNode(moduleName, column.Name)
 						if column.Type == nil {
-							log.Fatalf("[E] Module %s: Type not found for node %s\n", moduleName, column.Name)
+							log.Fatalf("[E] Module %s: Type not found for row node %s\n", moduleName, column.Name)
 						}
 
 						switch column.Type.Name {
@@ -258,7 +258,7 @@ var generateCmd = &cobra.Command{
 
 						typeModuleName, ok := moduleImportMap[column.Type.Name]
 						if !ok {
-							log.Fatalf("[E] Module %s: Type %s not found for node %s\n", moduleName, column.Type.Name, column.Name)
+							log.Fatalf("[E] Module %s: Type %s not found for row node %s\n", moduleName, column.Type.Name, column.Name)
 						}
 						importMap.AddType(typeModuleName, column.Type.Name)
 					}
@@ -276,7 +276,7 @@ var generateCmd = &cobra.Command{
 						}
 
 						if index.Type == nil {
-							log.Fatalf("[E] Module %s: Type not found for node %s\n", moduleName, index.Name)
+							log.Fatalf("[E] Module %s: Type not found for index node %s\n", moduleName, index.Name)
 						}
 
 						indexModuleImportMap := moduleImportMap
@@ -307,7 +307,7 @@ var generateCmd = &cobra.Command{
 
 						typeModuleName, ok := indexModuleImportMap[index.Type.Name]
 						if !ok {
-							log.Fatalf("[E] Module %s: Type %s not found for node %s\n", moduleName, index.Type.Name, index.Name)
+							log.Fatalf("[E] Module %s: Type %s not found for index node %s\n", moduleName, index.Type.Name, index.Name)
 						}
 						importMap.AddType(typeModuleName, index.Type.Name)
 					}
@@ -601,7 +601,7 @@ func generateNodePartScalar(buf io.Writer, node gosmi.SmiNode, moduleName string
 
 	typeModuleName, ok := moduleImportMap[node.Type.Name]
 	if !ok {
-		log.Fatalf("[E] Module %s: Type %s not found for node %s\n", moduleName, node.Type.Name, node.Name)
+		log.Fatalf("[E] Module %s: Type %s not found for scalar node %s\n", moduleName, node.Type.Name, node.Name)
 	}
 	importMap.AddType(typeModuleName, node.Type.Name)
 	fmt.Fprintf(buf, "\tType: %sType,\n", formatNodeVarName(typeModuleName, node.Type.Name))
