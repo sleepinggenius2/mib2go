@@ -47,6 +47,20 @@ import (
 `
 const allowedNodeKinds = types.NodeScalar | types.NodeTable | types.NodeRow | types.NodeColumn | types.NodeNotification
 
+type processingFlag uint64
+
+const (
+	flagBrokenScalars processingFlag = 1 << iota
+)
+
+func (f processingFlag) All(flag processingFlag) bool { return f&flag == flag }
+func (f processingFlag) Any(flag processingFlag) bool { return f&flag > 0 }
+
+type MibModule struct {
+	Module gosmi.SmiModule
+	Flags  processingFlag
+}
+
 type ImportType string
 
 const (
@@ -165,9 +179,10 @@ var generateCmd = &cobra.Command{
 		firstModule := true
 		modulesLoaded := make(map[string]bool, len(args))
 		for _, arg := range args {
-			moduleName, err := gosmi.LoadModule(arg)
+			parts := strings.SplitN(arg, ":", 2)
+			moduleName, err := gosmi.LoadModule(parts[0])
 			if err != nil {
-				return errors.Wrapf(err, "Loading module %s", arg)
+				return errors.Wrapf(err, "Loading module %s", parts[0])
 			}
 
 			module, err := gosmi.GetModule(moduleName)
@@ -175,9 +190,21 @@ var generateCmd = &cobra.Command{
 				return errors.Wrapf(err, "Getting module %s", moduleName)
 			}
 
+			var flags processingFlag
+			if len(parts) > 1 {
+				for _, flag := range strings.Split(parts[1], ",") {
+					switch flag {
+					case "brokenscalars":
+						flags |= flagBrokenScalars
+					default:
+						log.Printf("[I] Unknown flag for %s: %s", moduleName, flag)
+					}
+				}
+			}
+
 			fileBuf := &bytes.Buffer{}
 
-			importTypes := generateMibFile(module, fileBuf)
+			importTypes := generateMibFile(MibModule{module, flags}, fileBuf, flags)
 
 			writeHeader := out == nil || firstModule
 			err = writeModule(module, fileBuf, out, writeHeader, importTypes)
@@ -329,7 +356,7 @@ var generateCmd = &cobra.Command{
 
 			fileBuf := &bytes.Buffer{}
 
-			importTypes := generatePartialMibFile(module, fileBuf, imports)
+			importTypes := generatePartialMibFile(module, fileBuf, imports, 0)
 
 			writeHeader := out == nil
 			err = writeModule(module, fileBuf, out, writeHeader, importTypes)
@@ -414,7 +441,8 @@ func formatNodeVarName(moduleName string, nodeName string) (formattedName string
 	return formatModuleVarName(moduleName) + formatNodeName(nodeName)
 }
 
-func generateMibFile(module gosmi.SmiModule, buf io.Writer) (importTypes bool) {
+func generateMibFile(m MibModule, buf io.Writer, flags processingFlag) (importTypes bool) {
+	module := m.Module
 	imports := module.GetImports()
 	nodes := module.GetNodes(allowedNodeKinds)
 	types := module.GetTypes()
@@ -433,11 +461,11 @@ func generateMibFile(module gosmi.SmiModule, buf io.Writer) (importTypes bool) {
 		moduleImportMap[t.Name] = module.Name
 	}
 
-	generateModuleStruct(buf, module.Name, nodes, types)
-	generateModuleVar(buf, module.Name, nodes, types)
+	generateModuleStruct(buf, module.Name, nodes, types, flags)
+	generateModuleVar(buf, module.Name, nodes, types, flags)
 
 	for _, node := range nodes {
-		if generateNodeVar(buf, module.Name, node, moduleImportMap) {
+		if generateNodeVar(buf, module.Name, node, moduleImportMap, flags) {
 			importTypes = true
 		}
 	}
@@ -450,7 +478,7 @@ func generateMibFile(module gosmi.SmiModule, buf io.Writer) (importTypes bool) {
 	return
 }
 
-func generatePartialMibFile(module gosmi.SmiModule, buf io.Writer, imports map[string]ImportType) (importTypes bool) {
+func generatePartialMibFile(module gosmi.SmiModule, buf io.Writer, imports map[string]ImportType, flags processingFlag) (importTypes bool) {
 	nodes := make([]gosmi.SmiNode, 0, len(imports))
 	types := make([]gosmi.SmiType, 0, len(imports))
 	for importName, importType := range imports {
@@ -473,8 +501,8 @@ func generatePartialMibFile(module gosmi.SmiModule, buf io.Writer, imports map[s
 	sort.Slice(nodes, func(i int, j int) bool { return nodes[i].Name < nodes[j].Name })
 	sort.Slice(types, func(i int, j int) bool { return types[i].Name < types[j].Name })
 
-	generateModuleStruct(buf, module.Name, nodes, types)
-	generateModuleVar(buf, module.Name, nodes, types)
+	generateModuleStruct(buf, module.Name, nodes, types, flags)
+	generateModuleVar(buf, module.Name, nodes, types, flags)
 
 	moduleImports := module.GetImports()
 	moduleNodes := module.GetNodes(allowedNodeKinds)
@@ -495,7 +523,7 @@ func generatePartialMibFile(module gosmi.SmiModule, buf io.Writer, imports map[s
 	}
 
 	for _, node := range nodes {
-		if generateNodeVar(buf, module.Name, node, moduleImportMap) {
+		if generateNodeVar(buf, module.Name, node, moduleImportMap, flags) {
 			importTypes = true
 		}
 	}
@@ -508,7 +536,7 @@ func generatePartialMibFile(module gosmi.SmiModule, buf io.Writer, imports map[s
 	return
 }
 
-func generateModuleStruct(buf io.Writer, moduleName string, nodes []gosmi.SmiNode, types []gosmi.SmiType) {
+func generateModuleStruct(buf io.Writer, moduleName string, nodes []gosmi.SmiNode, types []gosmi.SmiType, flags processingFlag) {
 	if len(nodes)+len(types) == 0 {
 		return
 	}
@@ -527,7 +555,7 @@ func generateModuleStruct(buf io.Writer, moduleName string, nodes []gosmi.SmiNod
 	fmt.Fprintf(buf, "}\n\n")
 }
 
-func generateModuleVar(buf io.Writer, moduleName string, nodes []gosmi.SmiNode, types []gosmi.SmiType) {
+func generateModuleVar(buf io.Writer, moduleName string, nodes []gosmi.SmiNode, types []gosmi.SmiType, flags processingFlag) {
 	if len(nodes)+len(types) == 0 {
 		return
 	}
@@ -547,33 +575,33 @@ func generateModuleVar(buf io.Writer, moduleName string, nodes []gosmi.SmiNode, 
 	fmt.Fprintf(buf, "}\n\n")
 }
 
-func generateNodeVar(buf io.Writer, moduleName string, node gosmi.SmiNode, moduleImportMap map[string]string) (importTypes bool) {
+func generateNodeVar(buf io.Writer, moduleName string, node gosmi.SmiNode, moduleImportMap map[string]string, flags processingFlag) (importTypes bool) {
 	fmt.Fprintf(buf, "var %sNode = models.%sNode{\n", formatNodeVarName(moduleName, node.Name), node.Kind)
 
-	generateNodePartBaseNode(buf, node)
+	generateNodePartBaseNode(buf, node, flags)
 
 	switch node.Kind {
 	case types.NodeColumn, types.NodeScalar:
-		if generateNodePartScalar(buf, node, moduleName, moduleImportMap) {
+		if generateNodePartScalar(buf, node, moduleName, moduleImportMap, flags) {
 			importTypes = true
 		}
 	case types.NodeTable:
-		generateNodePartTable(buf, node, moduleName)
+		generateNodePartTable(buf, node, moduleName, flags)
 	case types.NodeRow:
-		generateNodePartRow(buf, node, moduleName, moduleImportMap)
+		generateNodePartRow(buf, node, moduleName, moduleImportMap, flags)
 	case types.NodeNotification:
-		generateNodePartNotification(buf, node, moduleName, moduleImportMap)
+		generateNodePartNotification(buf, node, moduleName, moduleImportMap, flags)
 	}
 
 	fmt.Fprintf(buf, "}\n\n")
 	return
 }
 
-func generateNodePartBaseNode(buf io.Writer, node gosmi.SmiNode) {
+func generateNodePartBaseNode(buf io.Writer, node gosmi.SmiNode, flags processingFlag) {
 	oid := node.Oid
 	oidFormatted := node.RenderNumeric()
 	oidLen := node.OidLen
-	if node.Kind == types.NodeScalar {
+	if !flags.All(flagBrokenScalars) && node.Kind == types.NodeScalar {
 		oid = append(oid, 0)
 		oidFormatted += ".0"
 		oidLen++
@@ -587,7 +615,7 @@ func generateNodePartBaseNode(buf io.Writer, node gosmi.SmiNode) {
 	fmt.Fprintf(buf, "\t},\n")
 }
 
-func generateNodePartScalar(buf io.Writer, node gosmi.SmiNode, moduleName string, moduleImportMap map[string]string) (importTypes bool) {
+func generateNodePartScalar(buf io.Writer, node gosmi.SmiNode, moduleName string, moduleImportMap map[string]string, flags processingFlag) (importTypes bool) {
 	if node.Type == nil {
 		log.Fatalf("[E] Module %s: Type not found for node %s\n", moduleName, node.Name)
 	}
@@ -609,11 +637,11 @@ func generateNodePartScalar(buf io.Writer, node gosmi.SmiNode, moduleName string
 	return
 }
 
-func generateNodePartTable(buf io.Writer, node gosmi.SmiNode, moduleName string) {
+func generateNodePartTable(buf io.Writer, node gosmi.SmiNode, moduleName string, processingFlags processingFlag) {
 	fmt.Fprintf(buf, "\tRow: %sNode,\n", formatNodeVarName(moduleName, node.GetRow().Name))
 }
 
-func generateNodePartRow(buf io.Writer, node gosmi.SmiNode, moduleName string, moduleImportMap map[string]string) {
+func generateNodePartRow(buf io.Writer, node gosmi.SmiNode, moduleName string, moduleImportMap map[string]string, flags processingFlag) {
 	fmt.Fprintf(buf, "\tColumns: []models.ColumnNode{\n")
 	_, columnOrder := node.GetColumns()
 	for _, columnName := range columnOrder {
@@ -644,7 +672,7 @@ func generateNodePartRow(buf io.Writer, node gosmi.SmiNode, moduleName string, m
 	fmt.Fprintf(buf, "\t},\n")
 }
 
-func generateNodePartNotification(buf io.Writer, node gosmi.SmiNode, moduleName string, moduleImportMap map[string]string) {
+func generateNodePartNotification(buf io.Writer, node gosmi.SmiNode, moduleName string, moduleImportMap map[string]string, flags processingFlag) {
 	objects := node.GetNotificationObjects()
 	fmt.Fprintf(buf, "\tObjects: []models.ScalarNode{\n")
 	for _, object := range objects {
